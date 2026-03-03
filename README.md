@@ -1,4 +1,4 @@
-# Darknet Mesh Chat 📡🔒
+# Mesh Chat 📡🔒
 
 A privacy-first, peer-to-peer messaging app that works without internet or cellular service. Built on Bluetooth Low Energy mesh networking with end-to-end encryption.
 
