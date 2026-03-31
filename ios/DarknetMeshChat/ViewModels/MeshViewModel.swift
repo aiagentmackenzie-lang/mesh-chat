@@ -35,6 +35,12 @@ class MeshViewModel {
     }
 
     func initializeBLE() {
+        bleService.channelKeyProvider = { [weak self] channelName in
+            self?.sharedKey(forRemoteChannelName: channelName)
+        }
+        bleService.onMessageReceived = { [weak self] packet, decryptedContent in
+            self?.handleReceivedPacket(packet, decryptedContent: decryptedContent)
+        }
         bleService.initialize()
     }
 
@@ -49,8 +55,9 @@ class MeshViewModel {
     func sendMessage(content: String, channelId: String) {
         guard let identity else { return }
         guard let channel = channels.first(where: { $0.id == channelId }) else { return }
+        guard let channelKey = sharedKey(for: channel) else { return }
 
-        let encrypted = CryptoService.encrypt(content, key: channel.sharedKey) ?? content
+        guard let encrypted = CryptoService.encrypt(content, key: channelKey) else { return }
 
         let message = ChatMessage(
             id: UUID().uuidString,
@@ -93,16 +100,19 @@ class MeshViewModel {
         bleService.sendMessage(packet)
 
         persistState()
-        simulateReply(channelId: channelId)
     }
 
     func createChannel(name: String, type: ChannelType, password: String?, ttl: MessageTTL) {
+        let normalizedName = name.uppercased()
+        let sharedKey = type == .publicMesh
+            ? CryptoService.derivedChannelKey(name: normalizedName, password: password)
+            : CryptoService.generateSymmetricKey()
         let channel = Channel(
             id: "ch-\(UUID().uuidString.prefix(8))",
-            name: name.uppercased(),
+            name: normalizedName,
             type: type,
             members: [identity?.alias ?? ""],
-            sharedKey: CryptoService.generateSymmetricKey(),
+            sharedKey: sharedKey,
             password: password?.isEmpty == true ? nil : password,
             ttl: ttl,
             lastActivity: Date(),
@@ -191,50 +201,101 @@ class MeshViewModel {
         StorageService.saveMessages(messages)
     }
 
-    private func simulateReply(channelId: String) {
-        let aliases = nearbyNodes.isEmpty
-            ? ["GHOST-X9", "WRAITH-B2", "SPECTER-7F"]
-            : nearbyNodes.map(\.alias)
-
-        Task { @MainActor in
-            try? await Task.sleep(for: .seconds(Double.random(in: 1.5...4.0)))
-            let replies = [
-                "copy that",
-                "mesh relay confirmed",
-                "signal strong here",
-                "anyone else on this freq?",
-                "acknowledged",
-                "routing through node 3",
-                "encrypted channel stable",
-                "darknet protocol active",
-            ]
-
-            let reply = ChatMessage(
-                id: UUID().uuidString,
-                fromAlias: aliases.randomElement() ?? "UNKNOWN",
-                fromKey: "",
-                toTarget: "",
-                channelId: channelId,
-                content: replies.randomElement() ?? "...",
-                hops: Int.random(in: 0...3),
-                maxHops: settings.hopLimit,
-                timestamp: Date(),
-                ttl: nil,
-                type: .msg,
-                deliveryStatus: .delivered
-            )
-
-            var channelMessages = messages[channelId] ?? []
-            channelMessages.append(reply)
-            messages[channelId] = channelMessages
-
-            if let idx = channels.firstIndex(where: { $0.id == channelId }) {
-                channels[idx].lastActivity = Date()
-                channels[idx].lastMessagePreview = reply.content
-                channels[idx].unreadCount += 1
-            }
-
-            persistState()
+    private func sharedKey(for channel: Channel) -> String? {
+        switch channel.type {
+        case .publicMesh:
+            return CryptoService.derivedChannelKey(name: channel.name, password: channel.password)
+        case .private1to1, .group:
+            return channel.sharedKey
         }
+    }
+
+    private func sharedKey(forRemoteChannelName channelName: String) -> String? {
+        let normalizedRemoteName = channelName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedPublicName = normalizedRemoteName.hasPrefix("#")
+            ? String(normalizedRemoteName.dropFirst()).uppercased()
+            : normalizedRemoteName.uppercased()
+
+        if let channel = channels.first(where: {
+            $0.displayName.caseInsensitiveCompare(normalizedRemoteName) == .orderedSame ||
+            $0.name.caseInsensitiveCompare(normalizedPublicName) == .orderedSame
+        }) {
+            return sharedKey(for: channel)
+        }
+
+        if normalizedRemoteName.hasPrefix("#") {
+            return CryptoService.derivedChannelKey(name: normalizedPublicName, password: nil)
+        }
+
+        return nil
+    }
+
+    private func handleReceivedPacket(_ packet: MeshPacket, decryptedContent: String) {
+        guard !dedupIds.contains(packet.id) else { return }
+
+        dedupIds.append(packet.id)
+        if dedupIds.count > 500 {
+            dedupIds.removeFirst(dedupIds.count - 500)
+        }
+        StorageService.saveDedupIds(dedupIds)
+
+        let channelId = ensureChannelExists(for: packet)
+        let message = ChatMessage(
+            id: packet.id,
+            fromAlias: packet.from,
+            fromKey: packet.fromKey,
+            toTarget: packet.to,
+            channelId: channelId,
+            content: decryptedContent,
+            hops: packet.hops,
+            maxHops: packet.maxHops,
+            timestamp: Date(timeIntervalSince1970: TimeInterval(packet.ts) / 1000),
+            ttl: packet.ttl.map { Date(timeIntervalSince1970: TimeInterval($0) / 1000) },
+            type: MessageType(rawValue: packet.type) ?? .msg,
+            deliveryStatus: .delivered
+        )
+
+        var channelMessages = messages[channelId] ?? []
+        channelMessages.append(message)
+        messages[channelId] = channelMessages
+
+        if let idx = channels.firstIndex(where: { $0.id == channelId }) {
+            channels[idx].lastActivity = message.timestamp
+            channels[idx].lastMessagePreview = decryptedContent
+            channels[idx].unreadCount += 1
+        }
+
+        persistState()
+    }
+
+    private func ensureChannelExists(for packet: MeshPacket) -> String {
+        if let existingChannel = channels.first(where: {
+            $0.displayName.caseInsensitiveCompare(packet.channel) == .orderedSame ||
+            $0.name.caseInsensitiveCompare(packet.channel.replacingOccurrences(of: "#", with: "")) == .orderedSame
+        }) {
+            return existingChannel.id
+        }
+
+        let channelName = packet.channel.hasPrefix("#")
+            ? String(packet.channel.dropFirst()).uppercased()
+            : packet.channel.uppercased()
+        let channelType: ChannelType = packet.channel.hasPrefix("#") ? .publicMesh : .group
+        let sharedKey = channelType == .publicMesh
+            ? CryptoService.derivedChannelKey(name: channelName, password: nil)
+            : CryptoService.generateSymmetricKey()
+
+        let channel = Channel(
+            id: "ch-\(UUID().uuidString.prefix(8))",
+            name: channelName,
+            type: channelType,
+            members: [packet.from],
+            sharedKey: sharedKey,
+            ttl: packet.ttl == nil ? .infinite : .oneDay,
+            lastActivity: Date(),
+            unreadCount: 1,
+            createdAt: Date()
+        )
+        channels.append(channel)
+        return channel.id
     }
 }

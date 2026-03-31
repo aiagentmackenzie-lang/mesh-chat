@@ -39,6 +39,12 @@ nonisolated enum CryptoService: Sendable {
         return String(data: decryptedData, encoding: .utf8)
     }
 
+    static func derivedChannelKey(name: String, password: String?) -> String {
+        let material = "mesh-chat|\(name.uppercased())|\((password ?? "").uppercased())"
+        let digest = SHA256.hash(data: Data(material.utf8))
+        return Data(digest).base64EncodedString()
+    }
+
     static func generatePairingCode() -> String {
         String(format: "%04d", Int.random(in: 1000...9999))
     }
